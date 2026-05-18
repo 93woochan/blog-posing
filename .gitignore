@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+data/auth_state.json
+data/raw_posts/
+photos/
+*.log
+debug_*
+get-pip.py
+.claude/
