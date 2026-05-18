@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-# 프로젝트 루트
-ROOT_DIR = Path(__file__).resolve().parent.parent
+# 프로젝트 루트 — frozen exe(PyInstaller)면 exe 위치, 아니면 소스 루트
+if getattr(sys, "frozen", False):
+    ROOT_DIR = Path(sys.executable).parent
+else:
+    ROOT_DIR = Path(__file__).resolve().parent.parent
 
 # .env 로드
 load_dotenv(ROOT_DIR / ".env")
@@ -22,7 +26,7 @@ NAVER_PW: str = os.getenv("NAVER_PW", "")
 _cat_no = os.getenv("CATEGORY_NO", "").strip()
 CATEGORY_NO: int | None = int(_cat_no) if _cat_no.isdigit() else None
 NUM_POSTS: int = int(os.getenv("NUM_POSTS", "10"))
-ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 
 # ─── 경로 ───────────────────────────────────────────────────
 DATA_DIR = ROOT_DIR / "data"
@@ -36,6 +40,5 @@ PHOTOS_DIR = ROOT_DIR / "photos"
 for d in (DATA_DIR, RAW_POSTS_DIR, PHOTOS_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-# ─── Claude 모델 ────────────────────────────────────────────
-MODEL_SONNET = "claude-sonnet-4-6"
-MODEL_HAIKU = "claude-haiku-4-5-20251001"
+# ─── Gemini 모델 ────────────────────────────────────────────
+MODEL_GEMINI = "gemini-2.5-flash"

@@ -216,17 +216,52 @@ def open_write_page(page: Page) -> None:
     # SmartEditor 가 보통 'mainFrame' 이름의 iframe 안에 있음
     # 일부 케이스에서 alert/팝업 (작성중인 글 있음) 뜸 — 자동으로 끌어다 쓰지 않고 처음부터 작성하는 쪽 선택
     try:
-        # "새로 작성" 또는 "취소" 버튼 클릭 시도
-        for txt in ("취소", "새로 작성", "처음부터 작성", "닫기"):
-            btn = page.get_by_role("button", name=txt).first
+        # "취소" = 이전 임시저장 버리고 새로 작성
+        handled = False
+
+        # 1) CSS 셀렉터로 취소/닫기 버튼 직접 찾기
+        cancel_selectors = [
+            "button.se-popup-button-cancel",
+            "button[class*='cancel']",
+            "button[class*='Cancel']",
+            ".se-popup-button:last-child",
+            ".btn_cancel",
+        ]
+        for sel in cancel_selectors:
             try:
-                if btn.is_visible(timeout=2000):
-                    btn.click()
-                    log(f"팝업 처리: '{txt}' 클릭")
+                el = page.query_selector(sel)
+                if el and el.is_visible():
+                    el.click()
+                    log(f"팝업 처리: CSS '{sel}' 클릭")
                     time.sleep(1.0)
+                    handled = True
                     break
             except Exception:
                 continue
+
+        # 2) 텍스트 기반
+        if not handled:
+            for txt in ("취소", "새로 작성", "처음부터 작성", "닫기"):
+                btn = page.get_by_role("button", name=txt).first
+                try:
+                    if btn.is_visible(timeout=1500):
+                        btn.click()
+                        log(f"팝업 처리: '{txt}' 클릭")
+                        time.sleep(1.0)
+                        handled = True
+                        break
+                except Exception:
+                    continue
+
+        # 3) 팝업 안 버튼 전체 탐색 — 마지막(취소) 버튼 클릭
+        if not handled:
+            popup_btns = page.query_selector_all(
+                ".se-popup button, [role='dialog'] button, .modal button"
+            )
+            if popup_btns:
+                popup_btns[-1].click()
+                log(f"팝업 처리: 마지막 버튼 클릭")
+                time.sleep(1.0)
     except Exception:
         pass
 
@@ -458,8 +493,9 @@ def _focus_body(page: Page, frame) -> None:
             continue
 
 
-def write_body(page: Page, frame, body_blocks: list[dict], folder: Path) -> None:
-    """본문 블록(text/image) 을 순서대로 입력."""
+def write_body(page: Page, frame, body_blocks: list[dict], folder: Path,
+               tags: list[str] | None = None) -> None:
+    """본문 블록(text/image) 을 순서대로 입력. tags 있으면 본문 마지막에 #태그 추가."""
     import os as _os
 
     # 첫 번째 본문 영역 클릭 — 커서를 에디터 본문에 위치
@@ -485,9 +521,8 @@ def write_body(page: Page, frame, body_blocks: list[dict], folder: Path) -> None
             # 이미지 삽입 후: 다음 블록이 텍스트면 에디터 본문에 포커스 재확보
             next_block = body_blocks[i] if i < len(body_blocks) else None
             if next_block and next_block.get("type") == "text":
-                # 패널 닫힌 후 본문 클릭 (키보드 포커스 복구)
                 time.sleep(0.3)
-                page.keyboard.press("Escape")  # 혹시 남은 패널 한 번 더 닫기
+                page.keyboard.press("Escape")
                 time.sleep(0.2)
             caption = block.get("caption", "")
             if caption:
@@ -496,58 +531,34 @@ def write_body(page: Page, frame, body_blocks: list[dict], folder: Path) -> None
         else:
             log(f"    ⚠️ 알 수 없는 블록 타입: {btype}")
 
+    # 태그를 본문 하단에 #태그 형식으로 추가
+    if tags:
+        tag_line = " ".join(f"#{t}" for t in tags[:30])
+        log(f"태그 본문 추가: {tag_line}")
+        page.keyboard.press("Enter")
+        time.sleep(0.2)
+        type_text_block(page, tag_line)
 
-def set_category_and_tags(page: Page, tags: list[str]) -> None:
-    """우측 패널에서 카테고리 / 태그 설정."""
-    log("카테고리 / 태그 설정 시도...")
-    # 발행 영역 열기 (대부분 사이드 패널)
+
+def set_category(page: Page) -> None:
+    """우측 패널에서 카테고리 설정."""
+    log("카테고리 설정 시도...")
     try:
-        # '발행' 또는 '저장' 버튼 옆 메뉴 — 카테고리 셀렉터는 블로그 스킨마다 다름
         cat_btn = page.get_by_text(CATEGORY_NAME, exact=False).first
-        try:
-            if cat_btn.is_visible(timeout=2000):
-                cat_btn.click()
-                log(f"  카테고리 클릭: {CATEGORY_NAME}")
-        except Exception:
-            log(f"  ⚠️ 카테고리 '{CATEGORY_NAME}' 자동 선택 실패 — 수동 선택 필요")
+        if cat_btn.is_visible(timeout=2000):
+            cat_btn.click()
+            log(f"  카테고리 클릭: {CATEGORY_NAME}")
+            time.sleep(0.5)
     except Exception:
-        pass
-
-    # 태그 입력
-    tag_input_selectors = [
-        "input.tag_input",
-        "input[placeholder*='태그']",
-        "input[aria-label*='태그']",
-    ]
-    tag_input = None
-    for sel in tag_input_selectors:
-        try:
-            el = page.query_selector(sel)
-            if el:
-                tag_input = el
-                break
-        except Exception:
-            continue
-
-    if tag_input is None:
-        log("  ⚠️ 태그 입력란을 찾지 못함 — 수동 입력 필요")
-        return
-
-    for t in tags:
-        try:
-            tag_input.click()
-            page.keyboard.type(t, delay=10)
-            page.keyboard.press("Enter")
-            time.sleep(0.15)
-        except Exception:
-            continue
-    log(f"  태그 {len(tags)}개 입력 완료")
+        log(f"  ⚠️ 카테고리 '{CATEGORY_NAME}' 자동 선택 실패 — 수동 선택 필요")
 
 
 def save_temp(page: Page) -> bool:
     """임시저장 클릭."""
     log("임시저장 시도...")
-    for txt in ("저장", "임시저장"):
+
+    # 1) 텍스트로 찾기
+    for txt in ("임시저장", "저장"):
         try:
             btn = page.get_by_role("button", name=txt).first
             if btn.is_visible(timeout=2000):
@@ -557,6 +568,19 @@ def save_temp(page: Page) -> bool:
                 return True
         except Exception:
             continue
+
+    # 2) 해시 클래스명으로 찾기 (발행 패널 안 임시저장)
+    for sel in ("button[class*='save_btn']", "button[class*='temp']", "button[class*='draft']"):
+        try:
+            el = page.query_selector(sel)
+            if el and el.is_visible():
+                el.click()
+                time.sleep(2.5)
+                log(f"✓ 임시저장 클릭 ({sel})")
+                return True
+        except Exception:
+            continue
+
     log("❌ 저장 버튼 자동 클릭 실패 — 브라우저에서 직접 누르세요")
     return False
 
@@ -618,12 +642,12 @@ def main() -> int:
             type_title(page, frame, title)
             time.sleep(0.8)
 
-            # 본문 입력
-            write_body(page, frame, body_blocks, folder)
+            # 본문 입력 (태그도 본문 하단에 #태그 형식으로 추가)
+            write_body(page, frame, body_blocks, folder, tags=tags)
             time.sleep(1.5)
 
-            # 카테고리 / 태그
-            set_category_and_tags(page, tags)
+            # 카테고리
+            set_category(page)
             time.sleep(1.0)
 
             # 임시저장 (또는 발행)

@@ -1,4 +1,4 @@
-"""Phase A 2단계 — 수집한 글을 Claude에 보내 스타일 가이드 + 대표 예시를 추출.
+"""Phase A 2단계 — 수집한 글을 Gemini에 보내 스타일 가이드 + 대표 예시를 추출.
 
 실행:
     python -m src.learn
@@ -8,7 +8,7 @@
 
 산출물:
     data/style_guide.md   ← 스타일 규칙 (도입부, 본문 구조, 어휘, 이모지, 마무리 등)
-    data/exemplars.md     ← Claude가 고른 대표 글 3~5개 본문
+    data/exemplars.md     ← Gemini가 고른 대표 글 3~5개 본문
 """
 
 from __future__ import annotations
@@ -22,12 +22,12 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from anthropic import Anthropic
+from google import genai
 
 from src.config import (
-    ANTHROPIC_API_KEY,
+    GEMINI_API_KEY,
     EXEMPLARS_PATH,
-    MODEL_SONNET,
+    MODEL_GEMINI,
     RAW_POSTS_DIR,
     STYLE_GUIDE_PATH,
 )
@@ -124,7 +124,6 @@ def format_posts(posts: list[dict]) -> str:
 
 
 def extract_section(text: str, start_marker: str, end_marker: str) -> str:
-    """마커 사이의 내용을 추출. 못 찾으면 빈 문자열."""
     try:
         s = text.index(start_marker) + len(start_marker)
         e = text.index(end_marker, s)
@@ -134,8 +133,8 @@ def extract_section(text: str, start_marker: str, end_marker: str) -> str:
 
 
 def main() -> int:
-    if not ANTHROPIC_API_KEY:
-        print("❌ ANTHROPIC_API_KEY 가 .env 에 설정되어 있지 않습니다.")
+    if not GEMINI_API_KEY:
+        print("❌ GEMINI_API_KEY 가 .env 에 설정되어 있지 않습니다.")
         return 1
 
     posts = load_posts()
@@ -143,28 +142,23 @@ def main() -> int:
         print(f"❌ {RAW_POSTS_DIR} 에 글이 없습니다. 먼저 `python -m src.crawler` 를 실행하세요.")
         return 1
 
-    print(f"[learn] 글 {len(posts)}편 로드 완료. Claude에 분석 요청 중...")
+    print(f"[learn] 글 {len(posts)}편 로드 완료. Gemini에 분석 요청 중...")
 
-    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    from google.genai import types
+    client = genai.Client(api_key=GEMINI_API_KEY)
 
     user_msg = USER_TEMPLATE.format(n=len(posts), posts=format_posts(posts))
-
-    response = client.messages.create(
-        model=MODEL_SONNET,
-        max_tokens=8000,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_msg}],
+    response = client.models.generate_content(
+        model=MODEL_GEMINI,
+        contents=user_msg,
+        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
     )
-
-    text = "".join(
-        block.text for block in response.content if getattr(block, "type", "") == "text"
-    )
+    text = response.text
 
     style_guide = extract_section(text, "<<<STYLE_GUIDE_START>>>", "<<<STYLE_GUIDE_END>>>")
     exemplars = extract_section(text, "<<<EXEMPLARS_START>>>", "<<<EXEMPLARS_END>>>")
 
     if not style_guide or not exemplars:
-        # 마커가 누락된 경우 원본을 디버그용으로 저장
         Path("data/_raw_learn_output.txt").write_text(text, encoding="utf-8")
         print("⚠️  응답에서 마커를 찾지 못했습니다. data/_raw_learn_output.txt 확인.")
         return 1

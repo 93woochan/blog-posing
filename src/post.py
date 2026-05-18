@@ -1,4 +1,4 @@
-"""Phase B — 사진 폴더 + 메모로부터 블로그 본문을 생성.
+"""Phase B — 사진 폴더 + 메모로부터 Gemini가 블로그 본문을 생성.
 
 사용법:
     # 내돈내산 모드 (기본값)
@@ -9,7 +9,7 @@
 
 폴더 구조 예:
     photos/2026-05-15-cafexyz/
-    ├── info.txt          ← 카페 정보 메모 (필수)
+    ├── info.txt          ← 가게 정보 메모 (필수)
     ├── IMG_001.jpg
     ├── IMG_002.jpg
     └── ...
@@ -22,14 +22,11 @@ info.txt 형식 예:
     한줄평: 조용한 분위기, 재방문 의사 있음
     동행: 친구 1명
 
-동작 (현재 - Cowork 협업 모드):
-    1. info.txt + 사진 파일 목록 + 모드 정보를 읽음
-    2. 생성용 입력 패키지(JSON)를 ./generation_request.json 으로 저장
-    3. Cowork에서 Claude에게 "이 폴더로 본문 만들어줘" 요청하면 Claude가
-       style_guide.md + exemplars.md + 사진을 보고 본문 작성
-
-향후 (자동 모드):
-    Anthropic API를 이용해 Claude가 직접 본문을 생성하고 결과를 출력.
+동작:
+    1. info.txt + 사진을 Gemini에 전송
+    2. style_guide.md + exemplars.md 를 참조 프롬프트로 사용
+    3. Gemini가 본문 JSON 생성 → generated_post.json 으로 저장
+    4. 이후 publisher.py 로 네이버에 자동 포스팅
 """
 
 from __future__ import annotations
@@ -42,16 +39,23 @@ from pathlib import Path
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from src.config import EXEMPLARS_PATH, STYLE_GUIDE_PATH
+from google import genai
+from PIL import Image
+
+from src.config import (
+    EXEMPLARS_PATH,
+    GEMINI_API_KEY,
+    MODEL_GEMINI,
+    STYLE_GUIDE_PATH,
+)
 
 
 VALID_MODES = ("self_paid", "sponsored")
 INFO_FILENAME = "info.txt"
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".webp"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}  # HEIC 제외 (PIL 미지원)
 
 
 def parse_info(info_path: Path) -> dict:
-    """info.txt 를 key: value 형식으로 파싱."""
     info: dict[str, str] = {}
     if not info_path.exists():
         return info
@@ -62,14 +66,13 @@ def parse_info(info_path: Path) -> dict:
         if ":" in line:
             k, v = line.split(":", 1)
             info[k.strip()] = v.strip()
-        elif "：" in line:  # 전각 콜론
+        elif "：" in line:
             k, v = line.split("：", 1)
             info[k.strip()] = v.strip()
     return info
 
 
 def list_photos(folder: Path) -> list[str]:
-    """폴더 내 이미지 파일을 정렬해 상대경로 리스트로 반환."""
     photos = sorted(
         p for p in folder.iterdir()
         if p.is_file() and p.suffix.lower() in IMAGE_EXTS
@@ -77,48 +80,122 @@ def list_photos(folder: Path) -> list[str]:
     return [p.name for p in photos]
 
 
-def build_request(folder: Path, mode: str) -> dict:
-    """Cowork 모드용 생성 요청 패키지를 만든다."""
+def generate_post(folder: Path, mode: str) -> dict:
+    """Gemini API로 사진 + info.txt → 블로그 본문 JSON 생성."""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY 가 .env 에 설정되어 있지 않습니다.")
+
     info = parse_info(folder / INFO_FILENAME)
     photos = list_photos(folder)
 
+    if not photos:
+        raise FileNotFoundError(f"폴더에 사진이 없습니다: {folder}")
     if not STYLE_GUIDE_PATH.exists():
         raise FileNotFoundError(
-            f"style_guide.md 가 없습니다 ({STYLE_GUIDE_PATH}). "
-            "먼저 Phase A(크롤링 + 학습)를 완료하세요."
+            f"style_guide.md 가 없습니다. 먼저 Phase A(크롤링 + 학습)를 완료하세요."
         )
     if not EXEMPLARS_PATH.exists():
-        raise FileNotFoundError(
-            f"exemplars.md 가 없습니다 ({EXEMPLARS_PATH})."
-        )
+        raise FileNotFoundError(f"exemplars.md 가 없습니다.")
 
-    return {
-        "mode": mode,
-        "folder": str(folder.resolve()),
-        "info": info,
-        "photos": photos,
-        "style_guide_path": str(STYLE_GUIDE_PATH.resolve()),
-        "exemplars_path": str(EXEMPLARS_PATH.resolve()),
-        "instructions": (
-            "Claude는 다음을 수행한다:\n"
-            "  1. style_guide_path 의 가이드를 시스템 프롬프트로 적용.\n"
-            "  2. exemplars_path 의 예시 글을 참조 톤으로 사용.\n"
-            "  3. mode 값에 따라 sponsored 또는 self_paid 모드 규칙 적용.\n"
-            "  4. info 의 가게 정보(이름/위치/메뉴/한줄평/동행)를 본문에 자연스럽게 녹임.\n"
-            "  5. photos 파일들을 본문 흐름에 맞게 배치하고, 사진별 간단 캡션 자동 생성.\n"
-            "  6. 출력은 다음 JSON 형식:\n"
-            "     { \"title\": \"...\", \"tags\": [...], \"body\": [ "
-            "{\"type\":\"text\",\"content\":\"...\"}, "
-            "{\"type\":\"image\",\"filename\":\"IMG_001.jpg\",\"caption\":\"...\"}, "
-            "... ] }\n"
-            "  7. 사람 검토 후 OK 받으면 Playwright로 네이버에 임시저장."
-        ),
-    }
+    style_guide = STYLE_GUIDE_PATH.read_text(encoding="utf-8")
+    exemplars = EXEMPLARS_PATH.read_text(encoding="utf-8")
+    mode_label = "내돈내산(직접 구매)" if mode == "self_paid" else "협찬(제공받음)"
+    info_text = "\n".join(f"{k}: {v}" for k, v in info.items())
+    photo_order = "\n".join(f"{i+1}. {p}" for i, p in enumerate(photos))
+
+    prompt = f"""당신은 블로그 글 작성 전문가입니다. 아래 스타일 가이드와 예시를 참고해 블로그 본문을 작성하세요.
+
+## 스타일 가이드
+{style_guide}
+
+## 예시 글 (참고용)
+{exemplars}
+
+## 이번 포스팅 정보
+작성 모드: {mode_label}
+{info_text}
+
+## 첨부 사진 순서
+{photo_order}
+
+위 사진들을 순서대로 보고, 스타일 가이드에 맞게 블로그 본문을 작성하세요.
+사진은 본문 흐름에 자연스럽게 배치하고 각 사진에 짧은 캡션을 달아주세요.
+
+주의사항:
+- 절취선, 구분선(─, ━, —, ***, ---), 가로줄은 절대 사용하지 마세요.
+- 섹션 제목(## 같은 마크다운)도 사용하지 마세요.
+- 자연스러운 문단 흐름으로만 작성하세요.
+
+반드시 아래 JSON 형식으로만 출력하세요 (다른 텍스트 없이):
+{{
+  "title": "블로그 제목",
+  "tags": ["태그1", "태그2", "태그3"],
+  "body": [
+    {{"type": "text", "content": "텍스트 내용"}},
+    {{"type": "image", "filename": "IMG_001.jpg", "caption": "사진 설명"}},
+    {{"type": "text", "content": "다음 텍스트"}},
+    ...
+  ]
+}}"""
+
+    print(f"[post] 사진 {len(photos)}장 로드 중...")
+    parts: list = [prompt]
+    loaded = 0
+    for photo_name in photos:
+        photo_path = folder / photo_name
+        try:
+            img = Image.open(photo_path)
+            img.load()  # 파일 핸들 즉시 닫기 위해
+            parts.append(img)
+            loaded += 1
+        except Exception as e:
+            print(f"  ⚠️ 사진 로드 실패 (건너뜀): {photo_name} — {e}")
+
+    print(f"[post] Gemini에 요청 중... (사진 {loaded}장)")
+    client = genai.Client(api_key=GEMINI_API_KEY)
+
+    import time
+    for attempt in range(1, 4):
+        try:
+            response = client.models.generate_content(model=MODEL_GEMINI, contents=parts)
+            break
+        except Exception as e:
+            if attempt == 3 or "503" not in str(e):
+                raise
+            print(f"  서버 과부하, {15}초 후 재시도... ({attempt}/3)")
+            time.sleep(15)
+
+    text = response.text.strip()
+
+    # 마크다운 코드블록 제거
+    if "```json" in text:
+        text = text.split("```json")[1].split("```")[0].strip()
+    elif "```" in text:
+        text = text.split("```")[1].split("```")[0].strip()
+
+    post = json.loads(text)
+
+    # 절취선/구분선 후처리 — 모델이 무시해도 강제 제거
+    import re
+    divider_pattern = re.compile(
+        r"^[\s]*[-─━=*~_·•|▬]{3,}[\s]*$|"      # --- === *** ─── 등 단독 줄
+        r"^[\s]*[─━―—─=\-_]{3,}[\s]*$|"         # 유니코드 가로선 / 대시 단독 줄
+        r"^[\s]*([-─━=*~_·•|] *){3,}[\s]*$",    # "- - -" 공백 섞인 반복 패턴
+        re.MULTILINE,
+    )
+    for block in post.get("body", []):
+        if block.get("type") == "text":
+            cleaned = divider_pattern.sub("", block["content"])
+            # 연속 빈 줄 2개 이상 → 1개로
+            cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+            block["content"] = cleaned
+
+    return post
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="사진 폴더로부터 네이버 블로그 본문 생성 요청 패키지 만들기"
+        description="사진 폴더에서 Gemini로 네이버 블로그 본문 생성"
     )
     parser.add_argument("folder", help="사진과 info.txt 가 있는 폴더 경로")
     parser.add_argument(
@@ -126,11 +203,6 @@ def main() -> int:
         choices=VALID_MODES,
         default="self_paid",
         help="작성 모드 (기본: self_paid). 협찬은 sponsored.",
-    )
-    parser.add_argument(
-        "--out",
-        default="generation_request.json",
-        help="생성 요청 패키지를 저장할 파일명 (기본: generation_request.json)",
     )
     args = parser.parse_args()
 
@@ -152,31 +224,29 @@ def main() -> int:
         return 1
 
     try:
-        request = build_request(folder, args.mode)
-    except FileNotFoundError as e:
+        post = generate_post(folder, args.mode)
+    except (FileNotFoundError, RuntimeError) as e:
         print(f"❌ {e}")
         return 1
+    except json.JSONDecodeError as e:
+        print(f"❌ Gemini 응답 파싱 실패: {e}")
+        print("   응답이 JSON 형식이 아닙니다. 다시 시도해보세요.")
+        return 1
 
-    out_path = folder / args.out
+    out_path = folder / "generated_post.json"
     out_path.write_text(
-        json.dumps(request, ensure_ascii=False, indent=2),
+        json.dumps(post, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
-    print(f"✓ 생성 요청 패키지 저장: {out_path}")
+    print(f"✓ 본문 생성 완료: {out_path}")
     print()
-    print("─" * 60)
-    print(f"  모드:      {request['mode']}")
-    print(f"  사진:      {len(request['photos'])}장")
-    print(f"  info:      {len(request['info'])}개 항목")
-    print("─" * 60)
+    print(f"  제목: {post.get('title', '')}")
+    print(f"  태그: {', '.join(post.get('tags', []))}")
+    print(f"  블록: {len(post.get('body', []))}개")
     print()
-    print("다음 단계: Cowork(이 채팅)에 돌아와서 아래처럼 말씀해주세요:")
-    print()
-    print(f"   \"{folder} 폴더로 블로그 본문 만들어줘\"")
-    print()
-    print("그러면 Claude가 style_guide + exemplars + 사진을 보고")
-    print("본문을 생성하고, OK 받으면 네이버에 임시저장합니다.")
+    print("다음 단계: publish.bat 실행 또는")
+    print(f"  python -m src.publisher \"{folder}\"")
     return 0
 
 
