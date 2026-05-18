@@ -38,6 +38,13 @@ from playwright.sync_api import Page, sync_playwright
 
 from src.config import AUTH_STATE_PATH, BLOG_ID, CATEGORY_NAME, NAVER_ID, NAVER_PW
 
+# frozen exe: Playwright가 _MEIPASS 안을 뒤지지 않도록 브라우저 경로 고정
+if getattr(sys, "frozen", False):
+    import os as _os
+    _local = _os.environ.get("LOCALAPPDATA", "")
+    if _local and "PLAYWRIGHT_BROWSERS_PATH" not in _os.environ:
+        _os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(Path(_local) / "ms-playwright")
+
 
 # ─────────────────────────── 로깅 ───────────────────────────
 def log(msg: str) -> None:
@@ -170,100 +177,107 @@ def _is_login_page(page: Page) -> bool:
     return "nid.naver.com" in page.url or "nidlogin" in page.url
 
 
-def open_write_page(page: Page) -> None:
-    """블로그 글쓰기 페이지로 진입."""
-    url = f"https://blog.naver.com/PostWriteForm.naver?blogId={BLOG_ID}"
-    log(f"글쓰기 페이지 진입: {url}")
-    _safe_goto(page, url)
-    # SmartEditor ONE(SE4) 렌더링 대기 — React 앱이라 iframe 대신 se-title-text 감지
-    log("  SmartEditor 렌더링 대기 중...")
-    _editor_ready = False
-    for wait_sel in ("div.se-title-text", "div.se-container", "section.se-component"):
-        try:
-            page.wait_for_selector(wait_sel, timeout=15000)
-            log(f"  ✓ 에디터 감지됨: {wait_sel}")
-            _editor_ready = True
-            break
-        except Exception:
-            continue
-    if not _editor_ready:
-        # 구형 SmartEditor 2 (iframe 방식) 폴백
-        try:
-            page.wait_for_selector("iframe", timeout=5000)
-            log("  ✓ iframe 감지됨 (SE2 방식)")
-        except Exception:
-            log("  ⚠️ 에디터 감지 타임아웃 — 로드 상태 확인 필요")
+def open_write_page(page: Page, context) -> Page:
+    """블로그 홈 → 글쓰기 버튼 클릭 → 새 탭(에디터) 반환."""
+    log("네이버 블로그 홈 접근 중...")
+    _safe_goto(page, "https://section.blog.naver.com/BlogHome.naver")
+    try:
+        page.wait_for_load_state("networkidle", timeout=10000)
+    except Exception:
+        pass
     time.sleep(2.0)
 
-    current_url = page.url
-    log(f"  현재 URL: {current_url}")
-
-    # 로그인 페이지로 리다이렉트 됐는지 확인
     if _is_login_page(page):
-        raise RuntimeError(
-            "글쓰기 페이지 진입 실패 — 로그인 페이지로 리다이렉트됨.\n"
-            "  세션이 만료됐을 수 있습니다. data/auth_state.json 을 삭제하고 다시 실행하세요."
-        )
+        raise RuntimeError("로그인 페이지로 리다이렉트됨 — 세션 만료. data/auth_state.json 삭제 후 재시도.")
 
-    # 예상치 못한 URL (blog.naver.com 이 아닌 곳) 감지
-    if "blog.naver.com" not in current_url and "se.naver.com" not in current_url:
-        raise RuntimeError(
-            f"글쓰기 페이지 진입 실패 — 예상치 못한 URL: {current_url}\n"
-            "  로그인이 만료됐거나 BLOG_ID 가 잘못됐을 수 있습니다.\n"
-            "  data/auth_state.json 을 삭제하고 다시 실행하세요."
-        )
-
-    # SmartEditor 가 보통 'mainFrame' 이름의 iframe 안에 있음
-    # 일부 케이스에서 alert/팝업 (작성중인 글 있음) 뜸 — 자동으로 끌어다 쓰지 않고 처음부터 작성하는 쪽 선택
+    # 글쓰기 버튼 클릭 — 새 탭으로 열림
+    write_sel = "#container > div > aside > div > div:nth-child(1) > nav > a:nth-child(2)"
     try:
-        # "취소" = 이전 임시저장 버리고 새로 작성
-        handled = False
+        page.wait_for_selector(write_sel, timeout=8000)
+    except Exception as e:
+        try:
+            page.screenshot(path="debug_blog_home.png", full_page=True)
+        except Exception:
+            pass
+        raise RuntimeError(f"글쓰기 버튼을 찾지 못했습니다: {e}")
 
-        # 1) CSS 셀렉터로 취소/닫기 버튼 직접 찾기
-        cancel_selectors = [
-            "button.se-popup-button-cancel",
-            "button[class*='cancel']",
-            "button[class*='Cancel']",
-            ".se-popup-button:last-child",
-            ".btn_cancel",
-        ]
+    with context.expect_page() as new_page_info:
+        page.click(write_sel)
+
+    editor_page = new_page_info.value
+    log("  ✓ 글쓰기 새 탭 열림")
+    try:
+        editor_page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+    time.sleep(2.0)
+    log(f"  에디터 URL: {editor_page.url}")
+
+    # "작성 중인 글 있음" 팝업 → 취소(새로 작성) 클릭
+    _dismiss_draft_popup(editor_page)
+    time.sleep(1.0)  # 도움말 패널 렌더링 대기
+
+    return editor_page
+
+
+def _dismiss_draft_popup(editor_page: Page) -> None:
+    """임시저장된 글 불러오기 팝업이 뜨면 취소(새로 작성) 버튼 클릭."""
+    # editor_page 및 mainFrame 양쪽 탐색
+    mf = editor_page.frame(name="mainFrame")
+    contexts = ([mf, editor_page] if mf else [editor_page])
+
+    handled = False
+
+    # 1) CSS 셀렉터
+    cancel_selectors = [
+        "button.se-popup-button-cancel",
+        "button[class*='cancel']",
+        "button[class*='Cancel']",
+        ".se-popup-button:last-child",
+        ".btn_cancel",
+        "button.btn_close",
+    ]
+    for ctx in contexts:
         for sel in cancel_selectors:
             try:
-                el = page.query_selector(sel)
+                el = ctx.query_selector(sel)
                 if el and el.is_visible():
                     el.click()
-                    log(f"팝업 처리: CSS '{sel}' 클릭")
+                    log(f"  팝업 취소: CSS '{sel}'")
                     time.sleep(1.0)
                     handled = True
                     break
             except Exception:
                 continue
+        if handled:
+            return
 
-        # 2) 텍스트 기반
-        if not handled:
-            for txt in ("취소", "새로 작성", "처음부터 작성", "닫기"):
-                btn = page.get_by_role("button", name=txt).first
-                try:
-                    if btn.is_visible(timeout=1500):
-                        btn.click()
-                        log(f"팝업 처리: '{txt}' 클릭")
-                        time.sleep(1.0)
-                        handled = True
-                        break
-                except Exception:
-                    continue
+    # 2) 텍스트 기반
+    for ctx in contexts:
+        for txt in ("취소", "새로 작성", "처음부터 작성", "닫기"):
+            try:
+                btn = ctx.get_by_role("button", name=txt).first
+                if btn.is_visible(timeout=1000):
+                    btn.click()
+                    log(f"  팝업 취소: '{txt}' 클릭")
+                    time.sleep(1.0)
+                    return
+            except Exception:
+                continue
 
-        # 3) 팝업 안 버튼 전체 탐색 — 마지막(취소) 버튼 클릭
-        if not handled:
-            popup_btns = page.query_selector_all(
+    # 3) 팝업 안 버튼 전체 — 마지막 버튼이 보통 취소
+    for ctx in contexts:
+        try:
+            popup_btns = ctx.query_selector_all(
                 ".se-popup button, [role='dialog'] button, .modal button"
             )
             if popup_btns:
                 popup_btns[-1].click()
-                log(f"팝업 처리: 마지막 버튼 클릭")
+                log("  팝업 취소: 마지막 버튼 클릭")
                 time.sleep(1.0)
-    except Exception:
-        pass
+                return
+        except Exception:
+            continue
 
 
 def get_editor_frame(page: Page):
@@ -280,12 +294,16 @@ def get_editor_frame(page: Page):
     except Exception:
         pass
 
-    # SE2 — mainFrame 안에서 탐색
+    # SE2/SE4-in-iframe — mainFrame 안에서 탐색
     mf = page.frame(name="mainFrame")
     if mf is not None:
         try:
-            if (mf.query_selector("div.se-container")
-                    or mf.query_selector("input#subject")
+            # SE4 in iframe
+            if mf.query_selector("div.se-container") or mf.query_selector("div.se-title-text"):
+                log(f"  ✓ SE4-in-mainFrame 에디터: mainFrame 사용 ({mf.url[:60]})")
+                return mf
+            # SE2
+            if (mf.query_selector("input#subject")
                     or mf.query_selector("div#smarteditor")):
                 log(f"  ✓ SE2 에디터: mainFrame 사용 ({mf.url[:60]})")
                 return mf
@@ -328,11 +346,11 @@ def type_title(page: Page, frame, title: str) -> None:
                 el = ctx.query_selector(sel)
                 if el and el.is_visible():
                     el.click()
-                    time.sleep(0.3)
+                    time.sleep(0.15)
                     el.fill(title)
                     log("  ✓ SE2 방식 제목 입력 완료")
                     page.keyboard.press("Tab")
-                    time.sleep(0.5)
+                    time.sleep(0.2)
                     return
             except Exception:
                 continue
@@ -368,68 +386,106 @@ def type_title(page: Page, frame, title: str) -> None:
         return
 
     target.click()
-    time.sleep(0.5)
+    time.sleep(0.2)
     try:
         page.evaluate("text => navigator.clipboard.writeText(text)", title)
-        time.sleep(0.1)
+        time.sleep(0.08)
         page.keyboard.press("Control+v")
     except Exception:
-        page.keyboard.type(title, delay=10)
-    time.sleep(0.5)
-    page.keyboard.press("Tab")
-    time.sleep(0.5)
+        page.keyboard.type(title, delay=5)
+    time.sleep(0.2)
+    # SE4: Enter 키가 title→body 이동. Tab은 포커스를 엉뚱한 곳으로 보냄
+    page.keyboard.press("Enter")
+    time.sleep(0.3)
 
 
-def type_text_block(page: Page, content: str) -> None:
-    """본문 텍스트 블록 입력 — 클립보드 붙여넣기로 빠르게."""
+def type_text_block(page: Page, content: str, frame=None) -> None:
+    """본문 텍스트 블록 입력.
+
+    1순위: execCommand('insertText') — SE4 paste 핸들러 우회, 서식 미상속
+    2순위: clipboard + Ctrl+V 폴백
+    """
     if _is_login_page(page):
         raise RuntimeError("로그인 페이지에서 본문 입력 시도 차단 — 세션 만료 가능성")
+    ctx = frame if frame is not None else page
     if not content.strip():
         page.keyboard.press("Enter")
-        time.sleep(0.1)
+        time.sleep(0.05)
         return
     try:
-        # 클립보드에 쓰고 Ctrl+V 붙여넣기 (한번에 처리)
-        page.evaluate("text => navigator.clipboard.writeText(text)", content)
-        time.sleep(0.15)
+        ok = ctx.evaluate(
+            """(text) => {
+                // 현재 포커스가 제목 영역이면 거부
+                const active = document.activeElement;
+                if (active && (active.closest('.se-title-text') || active.closest('.se-title-input')))
+                    return false;
+                // 취소선 등 서식 초기화
+                try {
+                    if (document.queryCommandState('strikeThrough'))
+                        document.execCommand('strikeThrough', false, null);
+                    if (document.queryCommandState('bold'))
+                        document.execCommand('bold', false, null);
+                    if (document.queryCommandState('italic'))
+                        document.execCommand('italic', false, null);
+                    if (document.queryCommandState('underline'))
+                        document.execCommand('underline', false, null);
+                } catch(e) {}
+                return document.execCommand('insertText', false, text);
+            }""",
+            content,
+        )
+        if ok:
+            time.sleep(0.1)
+            page.keyboard.press("Enter")
+            time.sleep(0.05)
+            return
+    except Exception:
+        pass
+    # 폴백: clipboard + Ctrl+V
+    try:
+        ctx.evaluate("text => navigator.clipboard.writeText(text)", content)
+        time.sleep(0.08)
         page.keyboard.press("Control+v")
-        time.sleep(0.3)
+        time.sleep(0.15)
         page.keyboard.press("Enter")
     except Exception:
-        # 폴백: 줄별 타이핑 (delay 줄여서 속도 향상)
         for line in content.split("\n"):
             if line:
-                page.keyboard.type(line, delay=5)
+                page.keyboard.type(line, delay=3)
             page.keyboard.press("Enter")
-    time.sleep(0.2)
+    time.sleep(0.08)
 
 
 def insert_image(page: Page, frame, image_path: Path) -> None:
-    """SE4 이미지 업로드.
+    """SE4/SE2 이미지 업로드.
 
-    SE4 동작 원리:
-      '사진' 툴바 버튼 클릭 → JS 가 <input id='hidden-file' type='file'> 생성 후
-      즉시 .click() 호출 → OS 파일 탐색기 창이 열림.
-
-    Playwright expect_file_chooser 를 툴바 버튼 클릭 **전**에 활성화하면
-    OS 다이얼로그가 화면에 표시되기 전에 가로채 파일을 프로그래밍으로 지정.
-    → 파일 탐색기 창 미표시, 자동 무음 업로드.
+    frame(mainFrame) 안에서 먼저 이미지 툴바 버튼을 탐색한다.
+    SE4 동작: '사진' 버튼 클릭 → hidden file input 트리거 → expect_file_chooser 로 가로챔.
     """
     log(f"  📷 사진 업로드: {image_path.name}")
 
-    # ── 이미지 툴바 버튼 찾기 ─────────────────────────────────────
+    # ── 이미지 툴바 버튼 찾기 (frame 우선, page 폴백) ─────────────
     img_btn = None
-    for sel in (
-        "button.se-image-toolbar-button",
-        "button[data-name='image']",
-    ):
-        try:
-            el = page.query_selector(sel)
-            if el and el.is_visible():
-                img_btn = el
-                break
-        except Exception:
-            continue
+    for ctx in (frame, page):
+        for sel in (
+            "button.se-image-toolbar-button",
+            "button[data-name='image']",
+            "li[data-name='image'] button",
+            ".se-toolbar-item-image button",
+            "[data-name='image']",
+            "button[title*='사진']",
+            "button[title*='이미지']",
+            ".se-toolbar button:has(.se-icon-image)",
+        ):
+            try:
+                el = ctx.query_selector(sel)
+                if el and el.is_visible():
+                    img_btn = el
+                    break
+            except Exception:
+                continue
+        if img_btn:
+            break
 
     if img_btn is None:
         log("    ⚠️ 이미지 툴바 버튼 없음 — 텍스트 대체")
@@ -438,7 +494,6 @@ def insert_image(page: Page, frame, image_path: Path) -> None:
         return
 
     # ── expect_file_chooser 활성화 후 버튼 클릭 ──────────────────
-    # SE4 가 hidden-file input.click() 을 호출하는 순간 Playwright 가 가로챔
     upload_done = False
     try:
         with page.expect_file_chooser(timeout=5000) as fc_info:
@@ -450,10 +505,15 @@ def insert_image(page: Page, frame, image_path: Path) -> None:
         log(f"    file chooser 방식 실패 ({e}) — hidden-file 직접 시도")
 
     if not upload_done:
-        # 폴백: SE4 가 생성한 input#hidden-file 에 직접 set_input_files
         img_btn.click()
         time.sleep(1.0)
-        fi = page.query_selector("input#hidden-file") or page.query_selector("input[type='file']")
+        # frame 및 page 양쪽에서 파일 input 탐색
+        fi = None
+        for ctx in (frame, page):
+            fi = (ctx.query_selector("input#hidden-file")
+                  or ctx.query_selector("input[type='file']"))
+            if fi:
+                break
         if fi:
             fi.set_input_files(str(image_path))
             upload_done = True
@@ -465,29 +525,53 @@ def insert_image(page: Page, frame, image_path: Path) -> None:
             return
 
     # ── 업로드 완료 대기 ──────────────────────────────────────────
-    time.sleep(3.5)
+    time.sleep(2.5)
 
     # ── 이미지 다음 단락으로 커서 이동 ───────────────────────────
-    # SE4 는 이미지 삽입 후 새 빈 단락 자동 생성 — ArrowDown 으로 이동
     page.keyboard.press("ArrowDown")
-    time.sleep(0.2)
-    page.keyboard.press("End")
     time.sleep(0.1)
+    page.keyboard.press("End")
+    time.sleep(0.05)
 
 
 def _focus_body(page: Page, frame) -> None:
-    """SE4 본문 편집 영역에 포커스 (커서 위치 확보)."""
-    for sel in (
-        "div.se-body",
-        "div.se-content",
-        "div.se-component.se-text",
-        "section.se-component",
-    ):
+    """SE4/SE2 본문 편집 영역 포커스.
+
+    type_title 에서 Enter 로 이미 body 이동 완료.
+    현재 포커스가 title 영역이면 강제로 body로 이동, 아니면 유지.
+    """
+    js = """() => {
+        const active = document.activeElement;
+        // 이미 body에 있으면 취소선만 끄고 리턴
+        if (active && !active.closest('.se-title-text') && !active.closest('.se-title-input')) {
+            try {
+                if (document.queryCommandState('strikeThrough'))
+                    document.execCommand('strikeThrough', false, null);
+            } catch(e) {}
+            return true;
+        }
+        // title에 있으면 body 요소 탐색
+        const candidates = document.querySelectorAll(
+            'p.se-text-paragraph, div.se-text-paragraph, div[contenteditable="true"]'
+        );
+        for (const el of candidates) {
+            if (el.closest('.se-title-text') || el.closest('.se-title-input')) continue;
+            if (el.classList.contains('se-title-text') || el.classList.contains('se-title-input')) continue;
+            if (!el.offsetParent) continue;
+            el.focus();
+            try {
+                if (document.queryCommandState('strikeThrough'))
+                    document.execCommand('strikeThrough', false, null);
+            } catch(e) {}
+            return true;
+        }
+        return false;
+    }"""
+    for ctx in (frame, page):
         try:
-            el = frame.query_selector(sel) or page.query_selector(sel)
-            if el and el.is_visible():
-                el.click()
-                time.sleep(0.3)
+            ok = ctx.evaluate(js)
+            if ok:
+                time.sleep(0.1)
                 return
         except Exception:
             continue
@@ -506,7 +590,7 @@ def write_body(page: Page, frame, body_blocks: list[dict], folder: Path,
         btype = block.get("type")
         if btype == "text":
             log(f"[{i}/{len(body_blocks)}] 텍스트 단락 입력")
-            type_text_block(page, block.get("content", ""))
+            type_text_block(page, block.get("content", ""), frame=frame)
         elif btype == "image":
             filename = block.get("filename", "")
             image_path = folder / filename
@@ -537,7 +621,231 @@ def write_body(page: Page, frame, body_blocks: list[dict], folder: Path,
         log(f"태그 본문 추가: {tag_line}")
         page.keyboard.press("Enter")
         time.sleep(0.2)
-        type_text_block(page, tag_line)
+        type_text_block(page, tag_line, frame=frame)
+
+
+def close_help_panel(page: Page, frame) -> None:
+    """SE4 도움말 패널 닫기.
+
+    정확한 경로(사용자 확인):
+      div.se-dnd-wrap > div > div.se-container > article > div > header > button
+    UUID ID는 매번 바뀌므로 se-dnd-wrap 기준 직접 자식(>) 조합자로 탐색.
+    광범위 셀렉터 금지 — 툴바 포맷 버튼(취소선 등) 오클릭 방지.
+    """
+    contexts = ([frame, page] if frame and frame is not page else [page])
+
+    for ctx in contexts:
+        try:
+            found = ctx.evaluate("""() => {
+                // se-dnd-wrap 기준으로 정확한 경로 탐색
+                const roots = document.querySelectorAll('div.se-dnd-wrap, div.se-wrap');
+                for (const root of roots) {
+                    const btn = root.querySelector(
+                        'div.se-container > article > div > header > button'
+                    );
+                    if (btn && btn.offsetParent !== null) {
+                        btn.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""")
+            if found:
+                log("  도움말 패널 닫기 완료")
+                time.sleep(0.3)
+                return
+        except Exception:
+            continue
+
+    log("  도움말 패널 없음 또는 이미 닫힘")
+
+
+def insert_place(page: Page, frame, place_search: str) -> None:
+    """SE4 장소 추가 버튼 → 검색 → 첫 번째 결과 선택.
+
+    툴바 경로: div.se-dnd-wrap > div > header > div.se-header-inbox > ul > li.se-toolbar-item-map
+    버튼 클릭 후 팝업 창 / 인라인 패널 / 새 iframe 모두 대응.
+    """
+    if not place_search:
+        return
+    log(f"장소 추가: {place_search}")
+
+    contexts = ([frame, page] if frame and frame is not page else [page])
+
+    # ── 1) 팝업 감지하면서 버튼 클릭 ────────────────────────────
+    popup_page = None
+    clicked = False
+
+    def _click_map_btn(ctx_list) -> bool:
+        for ctx in ctx_list:
+            try:
+                result = ctx.evaluate("""() => {
+                    // 두 클래스 모두 가진 li 안의 button 탐색
+                    const selectors = [
+                        'li.se-toolbar-item.se-toolbar-item-map button',
+                        'li.se-toolbar-item-map button',
+                        'li.se-toolbar-item-map',
+                    ];
+                    for (const sel of selectors) {
+                        const btn = document.querySelector(sel);
+                        if (btn && btn.offsetParent !== null) { btn.click(); return true; }
+                    }
+                    return false;
+                }""")
+                if result:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    try:
+        with page.expect_popup(timeout=2500) as popup_info:
+            clicked = _click_map_btn(contexts)
+        popup_page = popup_info.value
+        log(f"  장소 팝업 창 감지: {popup_page.url[:80]}")
+        try:
+            popup_page.wait_for_load_state("domcontentloaded", timeout=8000)
+        except Exception:
+            pass
+    except Exception:
+        # 팝업 없음 — 이미 클릭됐으면 OK, 안 됐으면 재시도
+        if not clicked:
+            clicked = _click_map_btn(contexts)
+
+    if not clicked:
+        log("  ⚠️ 장소 버튼 없음 — 건너뜀")
+        return
+
+    time.sleep(1.5)
+
+    # ── 2) 검색 컨텍스트 수집 (팝업 > 새 iframe > 기존 컨텍스트) ─
+    search_ctxs: list = []
+    if popup_page:
+        search_ctxs = [popup_page]
+    else:
+        # 버튼 클릭 후 새로 생긴 iframe 탐색
+        existing = set(id(f) for f in ([frame] if frame else []))
+        new_frames = [f for f in page.frames
+                      if id(f) not in existing and f is not page.main_frame]
+        search_ctxs = new_frames + contexts
+
+    # ── 3) 검색어 입력 ──────────────────────────────────────────
+    search_selectors = [
+        "input[placeholder*='장소']",
+        "input[placeholder*='검색']",
+        "input[placeholder*='업체']",
+        "input[placeholder*='지역']",
+        "input[placeholder*='주소']",
+        "input[placeholder*='place']",
+        "input[placeholder*='search']",
+        ".se-place-search-input",
+        "input[type='search']",
+        "input[type='text']:not([style*='display:none'])",
+        "input[type='text']",
+    ]
+    typed = False
+    key_ctx = popup_page if popup_page else page  # 키보드 이벤트 대상
+    for ctx in search_ctxs:
+        for sel in search_selectors:
+            try:
+                el = ctx.query_selector(sel)
+                if el and el.is_visible():
+                    el.click()
+                    time.sleep(0.2)
+                    el.fill(place_search)
+                    time.sleep(0.3)
+                    key_ctx.keyboard.press("Enter")
+                    typed = True
+                    log(f"  검색어 입력: {place_search}  (sel={sel})")
+                    break
+            except Exception:
+                continue
+        if typed:
+            break
+
+    if not typed:
+        log("  ⚠️ 검색 입력창 없음 — 건너뜀")
+        return
+
+    time.sleep(2.5)  # 검색 결과 로딩 대기
+
+    time.sleep(2.5)  # 검색 결과 로딩 추가 대기
+
+    # ── 4) 첫 번째 결과 버튼 클릭 ───────────────────────────────
+    # 경로: .se-popup.se-popup-placesMap ul li button
+    _place_result_sel = ".se-popup.se-popup-placesMap ul li button"
+    result_clicked = False
+    for ctx in search_ctxs:
+        # 4-a) Playwright 클릭 (force=True 로 오버레이 무시)
+        try:
+            el = ctx.query_selector(_place_result_sel)
+            if el:
+                log(f"  결과 버튼 발견: {el.text_content()[:30] if el.text_content() else ''}")
+                el.click(timeout=3000, force=True)
+                result_clicked = True
+                log("  ✓ 장소 첫 번째 결과 선택")
+                break
+        except Exception as e:
+            log(f"  [클릭 오류] {e}")
+        # 4-b) JS dispatchEvent 폴백
+        try:
+            result_clicked = ctx.evaluate("""() => {
+                const popup = document.querySelector('.se-popup.se-popup-placesMap');
+                if (!popup) return false;
+                const btn = popup.querySelector('ul li button');
+                if (!btn) return false;
+                btn.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true}));
+                btn.dispatchEvent(new MouseEvent('mouseup',   {bubbles:true, cancelable:true}));
+                btn.dispatchEvent(new MouseEvent('click',     {bubbles:true, cancelable:true}));
+                return true;
+            }""")
+            if result_clicked:
+                log("  ✓ 장소 첫 번째 결과 선택 (JS)")
+                break
+        except Exception:
+            continue
+
+    if not result_clicked:
+        log("  ⚠️ 검색 결과 없음 — 건너뜀")
+        return
+
+    time.sleep(1.0)
+
+    # ── 5) 확인 버튼 클릭 (지도 삽입) ──────────────────────────
+    # 경로: .se-popup.se-popup-placesMap footer div button
+    _confirm_sel = ".se-popup.se-popup-placesMap footer div button"
+    confirmed = False
+    for ctx in search_ctxs:
+        try:
+            el = ctx.query_selector(_confirm_sel)
+            if el:
+                el.click(timeout=3000, force=True)
+                confirmed = True
+                log("  ✓ 장소 확인 버튼 클릭 (지도 삽입)")
+                break
+        except Exception as e:
+            log(f"  [확인 클릭 오류] {e}")
+        try:
+            confirmed = ctx.evaluate("""() => {
+                const popup = document.querySelector('.se-popup.se-popup-placesMap');
+                if (!popup) return false;
+                const btn = popup.querySelector('footer div button, footer button');
+                if (!btn) return false;
+                btn.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true}));
+                btn.dispatchEvent(new MouseEvent('mouseup',   {bubbles:true, cancelable:true}));
+                btn.dispatchEvent(new MouseEvent('click',     {bubbles:true, cancelable:true}));
+                return true;
+            }""")
+            if confirmed:
+                log("  ✓ 장소 확인 버튼 클릭 JS (지도 삽입)")
+                break
+        except Exception:
+            continue
+
+    if not confirmed:
+        log("  ⚠️ 확인 버튼 없음 — 건너뜀")
+
+    time.sleep(1.0)
 
 
 def set_category(page: Page) -> None:
@@ -553,35 +861,75 @@ def set_category(page: Page) -> None:
         log(f"  ⚠️ 카테고리 '{CATEGORY_NAME}' 자동 선택 실패 — 수동 선택 필요")
 
 
-def save_temp(page: Page) -> bool:
-    """임시저장 클릭."""
+def save_temp(page: Page, frame=None) -> bool:
+    """임시저장 클릭 (frame 우선, page 폴백)."""
     log("임시저장 시도...")
 
-    # 1) 텍스트로 찾기
+    contexts = ([frame, page] if frame and frame is not page else [page])
+
+    # 1) 텍스트 role 기반
     for txt in ("임시저장", "저장"):
+        for ctx in contexts:
+            try:
+                btn = ctx.get_by_role("button", name=txt).first
+                if btn.is_visible(timeout=1500):
+                    btn.click()
+                    time.sleep(2.5)
+                    log(f"✓ '{txt}' 버튼 클릭 완료")
+                    return True
+            except Exception:
+                continue
+
+    # 2) CSS 셀렉터
+    save_selectors = [
+        "button[class*='save_btn']",
+        "button[class*='temp']",
+        "button[class*='draft']",
+        "#btnSave",
+        ".btn_save",
+        "a[class*='save']",
+        ".se-save-btn",
+        "button[data-name='save']",
+        "a.btn_tempsave",
+        "button.btn_tempsave",
+    ]
+    for sel in save_selectors:
+        for ctx in contexts:
+            try:
+                el = ctx.query_selector(sel)
+                if el and el.is_visible():
+                    el.click()
+                    time.sleep(2.5)
+                    log(f"✓ 임시저장 클릭 ({sel})")
+                    return True
+            except Exception:
+                continue
+
+    # 3) JS로 텍스트 포함 버튼/링크 탐색 (button, a, input 모두)
+    js_click = """() => {
+        const tags = ['button', 'a', 'input'];
+        for (const tag of tags) {
+            for (const el of document.querySelectorAll(tag)) {
+                const txt = (el.textContent || el.value || '').trim();
+                if (txt.includes('임시저장') && el.offsetParent !== null) {
+                    el.click();
+                    return true;
+                }
+            }
+        }
+        return false;
+    }"""
+    for ctx in contexts:
         try:
-            btn = page.get_by_role("button", name=txt).first
-            if btn.is_visible(timeout=2000):
-                btn.click()
+            found = ctx.evaluate(js_click)
+            if found:
                 time.sleep(2.5)
-                log(f"✓ '{txt}' 클릭 완료")
+                log("✓ 임시저장 JS 클릭 완료")
                 return True
         except Exception:
             continue
 
-    # 2) 해시 클래스명으로 찾기 (발행 패널 안 임시저장)
-    for sel in ("button[class*='save_btn']", "button[class*='temp']", "button[class*='draft']"):
-        try:
-            el = page.query_selector(sel)
-            if el and el.is_visible():
-                el.click()
-                time.sleep(2.5)
-                log(f"✓ 임시저장 클릭 ({sel})")
-                return True
-        except Exception:
-            continue
-
-    log("❌ 저장 버튼 자동 클릭 실패 — 브라우저에서 직접 누르세요")
+    log("❌ 저장 버튼 자동 클릭 실패 — 브라우저에서 직접 눌러주세요")
     return False
 
 
@@ -604,12 +952,36 @@ def main() -> int:
     title = data.get("title", "(제목 없음)")
     body_blocks = data.get("body", [])
     tags = data.get("tags", [])
+    place_search = data.get("place_search", "")
+
+    # place_search 없으면 info.txt 에서 직접 구성
+    if not place_search:
+        info_path = folder / "info.txt"
+        if info_path.exists():
+            info: dict[str, str] = {}
+            for line in info_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                sep = ":" if ":" in line else ("：" if "：" in line else None)
+                if sep:
+                    k, v = line.split(sep, 1)
+                    info[k.strip()] = v.strip()
+            place_name = (
+                info.get("카페/음식점 이름") or info.get("카페 이름")
+                or info.get("음식점 이름") or info.get("가게 이름") or ""
+            )
+            location = info.get("위치", "")
+            place_search = f"{place_name} {location}".strip()
+
     log(f"본문 로드: 제목 \"{title[:40]}...\" / 블록 {len(body_blocks)}개 / 태그 {len(tags)}개")
+    if place_search:
+        log(f"장소 검색어: {place_search}")
 
     with sync_playwright() as p:
         # 저장된 세션이 있으면 로드
         ctx_kwargs = {
-            "viewport": {"width": 1280, "height": 900},
+            "no_viewport": True,
             "locale": "ko-KR",
             "permissions": ["clipboard-read", "clipboard-write"],
             "user_agent": (
@@ -622,10 +994,14 @@ def main() -> int:
             ctx_kwargs["storage_state"] = str(AUTH_STATE_PATH)
             log(f"저장된 세션 로드: {AUTH_STATE_PATH}")
 
-        browser = p.chromium.launch(headless=args.headless)
+        browser = p.chromium.launch(
+            headless=args.headless,
+            args=["--start-maximized"],
+        )
         context = browser.new_context(**ctx_kwargs)
         page = context.new_page()
 
+        editor_page = None
         try:
             # 로그인 확인 / 처리
             if not ensure_login(context, page):
@@ -633,46 +1009,58 @@ def main() -> int:
                 return 1
 
             # 글쓰기 페이지로
-            open_write_page(page)
-            time.sleep(1.5)
+            # 글쓰기 새 탭 열기 — editor_page 로 이후 모든 작업
+            editor_page = open_write_page(page, context)
+            time.sleep(0.5)
 
-            frame = get_editor_frame(page)
+            frame = get_editor_frame(editor_page)
+
+            # 도움말/가이드 패널 닫기
+            close_help_panel(editor_page, frame)
 
             # 제목 입력
-            type_title(page, frame, title)
-            time.sleep(0.8)
+            type_title(editor_page, frame, title)
+            time.sleep(0.5)
 
             # 본문 입력 (태그도 본문 하단에 #태그 형식으로 추가)
-            write_body(page, frame, body_blocks, folder, tags=tags)
-            time.sleep(1.5)
+            write_body(editor_page, frame, body_blocks, folder, tags=tags)
+            time.sleep(0.8)
+
+            # 장소 추가 (태그 이후)
+            insert_place(editor_page, frame, place_search)
 
             # 카테고리
-            set_category(page)
-            time.sleep(1.0)
+            set_category(editor_page)
+            time.sleep(0.5)
 
-            # 임시저장 (또는 발행)
-            if args.publish:
-                log("⚠️ --publish 모드: 즉시 발행은 너무 위험합니다.")
-                log("   브라우저에서 직접 [발행] 버튼을 눌러주세요.")
-                input("Enter 를 누르면 브라우저가 닫힙니다... ")
-            else:
-                save_temp(page)
-                log("✓ 임시저장 완료. 네이버 앱/PC에서 검토 후 직접 발행해주세요.")
-                input("브라우저를 확인 후 Enter 를 눌러 종료하세요... ")
+            log("✓ 글 작성 완료! 발행 후 브라우저를 직접 닫아주세요.")
 
         except Exception as e:
             log(f"❌ 오류 발생: {e}")
-            # 디버깅 스크린샷
             try:
                 page.screenshot(path=str(folder / "publish_error.png"), full_page=True)
                 log(f"디버그 스크린샷: {folder / 'publish_error.png'}")
             except Exception:
                 pass
-            input("Enter 를 누르면 종료합니다... ")
-            browser.close()
-            return 1
 
-        browser.close()
+        # 에디터 탭(또는 브라우저)이 닫힐 때까지 대기
+        log("브라우저를 닫으면 자동 종료됩니다.")
+        try:
+            target = None
+            for candidate in (editor_page, page):
+                if candidate is None:
+                    continue
+                try:
+                    if not candidate.is_closed():
+                        target = candidate
+                        break
+                except Exception:
+                    continue
+            if target is not None:
+                target.wait_for_event("close", timeout=0)
+        except Exception:
+            pass
+
     return 0
 
 

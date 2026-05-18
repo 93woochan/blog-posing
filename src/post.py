@@ -125,10 +125,13 @@ def generate_post(folder: Path, mode: str) -> dict:
 - 절취선, 구분선(─, ━, —, ***, ---), 가로줄은 절대 사용하지 마세요.
 - 섹션 제목(## 같은 마크다운)도 사용하지 마세요.
 - 자연스러운 문단 흐름으로만 작성하세요.
+- 주소(도로명 주소, 지번 주소 등)는 절대 제목에 넣지 마세요. 주소는 본문에만 포함하세요.
+- 제목은 가게/장소 이름과 분위기·특징·감성 키워드만 담아야 합니다.
 
 반드시 아래 JSON 형식으로만 출력하세요 (다른 텍스트 없이):
 {{
-  "title": "블로그 제목",
+  "title": "블로그 제목 (주소·번지 절대 포함 금지)",
+  "address": "실제 도로명 주소 (없으면 빈 문자열)",
   "tags": ["태그1", "태그2", "태그3"],
   "body": [
     {{"type": "text", "content": "텍스트 내용"}},
@@ -174,6 +177,48 @@ def generate_post(folder: Path, mode: str) -> dict:
         text = text.split("```")[1].split("```")[0].strip()
 
     post = json.loads(text)
+
+    # address 필드 처리: 제목에서 강제 제거 + 본문 하단에 추가
+    import re as _re
+    address = post.get("address", "").strip()
+
+    # 제목에서 주소 제거 (address 필드 값 + 일반 주소 패턴 모두 제거)
+    _title = post.get("title", "")
+    if address and address in _title:
+        _title = _title.replace(address, "")
+    # | 구분자 기준으로 주소처럼 보이는 파트 추가 제거
+    _addr_re = _re.compile(
+        r'\d+[-]\d+'
+        r'|\S+[길로가]\s*\d+'
+        r'|\d+층'
+        r'|[가-힣]+구\s+[가-힣]+[길로가]'
+        r'|서울\s*\S+구'
+    )
+    _parts = _re.split(r'\s*[|｜]\s*', _title)
+    _clean = [p.strip() for p in _parts if p.strip() and not _addr_re.search(p)]
+    post["title"] = " | ".join(_clean).strip(" |·,") if _clean else _title.strip()
+
+    # 본문 하단에 주소 추가 (이미 있으면 스킵)
+    if address:
+        body = post.get("body", [])
+        already_in_body = any(
+            address in b.get("content", "")
+            for b in body if b.get("type") == "text"
+        )
+        if not already_in_body:
+            body.append({"type": "text", "content": f"📍 {address}"})
+
+    # 장소 검색어 추가 (맛집/카페 등 위치 기반 포스팅)
+    place_name = (
+        info.get("카페/음식점 이름")
+        or info.get("카페 이름")
+        or info.get("음식점 이름")
+        or info.get("가게 이름")
+        or ""
+    )
+    location = info.get("위치", "")
+    if place_name:
+        post["place_search"] = f"{place_name} {location}".strip()
 
     # 절취선/구분선 후처리 — 모델이 무시해도 강제 제거
     import re

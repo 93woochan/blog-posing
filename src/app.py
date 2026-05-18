@@ -174,8 +174,13 @@ class App(ctk.CTk):
             font=ctk.CTkFont(size=15, weight="bold"), anchor="w"
         ).pack(fill="x", padx=10, pady=(15, 10))
 
-        fields = [("네이버 ID", "naver_id", False), ("네이버 PW", "naver_pw", True),
-                  ("카테고리",  "category",  False)]
+        fields = [
+            ("Gemini API 키", "gemini_key", True),
+            ("네이버 ID",     "naver_id",   False),
+            ("네이버 PW",     "naver_pw",   True),
+            ("블로그 ID",     "blog_id",    False),
+            ("카테고리",      "category",   False),
+        ]
         self.setting_entries: dict[str, ctk.CTkEntry] = {}
         for label, key, secret in fields:
             row = ctk.CTkFrame(parent, fg_color="transparent")
@@ -268,8 +273,9 @@ class App(ctk.CTk):
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
                 env[k.strip()] = v.strip()
-        mapping = {"NAVER_ID": "naver_id", "NAVER_PW": "naver_pw",
-                   "CATEGORY_NAME": "category"}
+        mapping = {"GEMINI_API_KEY": "gemini_key",
+                   "NAVER_ID": "naver_id", "NAVER_PW": "naver_pw",
+                   "BLOG_ID": "blog_id", "CATEGORY_NAME": "category"}
         for env_key, ui_key in mapping.items():
             val = env.get(env_key, "")
             if val:
@@ -277,9 +283,11 @@ class App(ctk.CTk):
                 self.setting_entries[ui_key].insert(0, val)
 
     def _save_settings(self):
-        naver_id = self.setting_entries["naver_id"].get().strip()
-        naver_pw = self.setting_entries["naver_pw"].get().strip()
-        category = self.setting_entries["category"].get().strip() or "맛집/카페"
+        gemini_key = self.setting_entries["gemini_key"].get().strip()
+        naver_id   = self.setting_entries["naver_id"].get().strip()
+        naver_pw   = self.setting_entries["naver_pw"].get().strip()
+        blog_id    = self.setting_entries["blog_id"].get().strip() or naver_id
+        category   = self.setting_entries["category"].get().strip() or "맛집/카페"
 
         env_path = ROOT_DIR / ".env"
         lines = []
@@ -293,10 +301,12 @@ class App(ctk.CTk):
                 else:
                     lines.append(line)
 
+        if gemini_key:
+            existing["GEMINI_API_KEY"] = gemini_key
         existing["NAVER_ID"] = naver_id
         existing["NAVER_PW"] = naver_pw
+        existing["BLOG_ID"]  = blog_id
         existing["CATEGORY_NAME"] = category
-        existing["BLOG_ID"] = naver_id
 
         out_lines = lines + [f"{k}={v}" for k, v in existing.items()]
         env_path.write_text("\n".join(out_lines), encoding="utf-8")
@@ -459,7 +469,7 @@ class App(ctk.CTk):
         if not self.post_ready:
             messagebox.showwarning("알림", "먼저 글을 생성해주세요.")
             return
-        self.pub_btn.configure(state="disabled", text="올리는 중...")
+        self.pub_btn.configure(state="disabled", text="작성 중... (브라우저 닫으면 완료)")
         threading.Thread(target=self._publish_worker, daemon=True).start()
 
     def _publish_worker(self):
@@ -486,7 +496,7 @@ class App(ctk.CTk):
 
             if result == 0:
                 self.after(0, lambda: messagebox.showinfo(
-                    "완료", "임시저장 완료!\n네이버에서 검토 후 발행해주세요."
+                    "완료", "글 작성 완료!\n네이버 블로그에서 확인 후 발행해주세요."
                 ))
         except SystemExit:
             pass
@@ -521,13 +531,31 @@ class App(ctk.CTk):
         threading.Thread(target=self._install_chromium, daemon=True).start()
 
     def _install_chromium(self):
-        import subprocess
+        import os
         self._set_status("Chromium 확인 중...")
+
+        if getattr(sys, "frozen", False):
+            # frozen exe: sys.executable = 자기 자신이므로 subprocess 설치 불가
+            # ms-playwright 폴더에 Chromium이 있는지 확인만 함
+            local = os.environ.get("LOCALAPPDATA", "")
+            ms_pw = Path(local) / "ms-playwright"
+            has_chromium = ms_pw.exists() and any(
+                d.is_dir() and d.name.startswith("chromium")
+                for d in ms_pw.iterdir()
+            ) if ms_pw.exists() else False
+
+            if not has_chromium:
+                self._log("⚠ Chromium 미설치. 같은 폴더의 크로미움_설치.bat을 먼저 실행하세요.")
+            self._set_status("준비 완료")
+            return
+
+        # 개발 환경: playwright install 실행
+        import subprocess
         result = subprocess.run(
             [sys.executable, "-m", "playwright", "install", "chromium"],
             capture_output=True, text=True,
         )
-        if "chromium" in result.stdout.lower() and "downloading" in result.stdout.lower():
+        if "download" in (result.stdout + result.stderr).lower():
             self._log("✓ Chromium 설치 완료")
         self._set_status("준비 완료")
 
