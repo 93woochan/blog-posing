@@ -13,3 +13,5 @@ build/
 dist/
 dist.zip
 *.spec
+data/exemplars.md
+data/style_guide.md
