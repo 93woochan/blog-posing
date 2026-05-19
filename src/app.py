@@ -18,6 +18,8 @@ if getattr(sys, "frozen", False):
         sys.path.insert(0, str(ROOT_DIR))
 else:
     ROOT_DIR = Path(__file__).resolve().parent.parent
+    if str(ROOT_DIR) not in sys.path:
+        sys.path.insert(0, str(ROOT_DIR))
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")

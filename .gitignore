@@ -9,3 +9,7 @@ photos/
 debug_*
 get-pip.py
 .claude/
+build/
+dist/
+dist.zip
+*.spec

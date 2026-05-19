@@ -4,7 +4,7 @@ echo   Build: Blog Auto Post Tool
 echo ============================================
 echo.
 
-cd /d "%~dp0"
+cd /d "%~dp0\.."
 
 echo [1/3] Building exe...
 
@@ -30,15 +30,15 @@ if not exist "dist\blog-autopost.exe" (
     exit /b 1
 )
 
-ren "dist\blog-autopost.exe" "ÀºÁöÀÇºí·Î±×.exe"
+ren "dist\blog-autopost.exe" "ï¿½ï¿½ï¿½ï¿½ï¿½Çºï¿½ï¿½Î±ï¿½.exe"
 
 echo.
 echo [2/3] Copying data files...
 if not exist "dist\data" mkdir "dist\data"
 if exist "data\style_guide.md" copy /y "data\style_guide.md" "dist\data\" >nul
 if exist "data\exemplars.md"   copy /y "data\exemplars.md"   "dist\data\" >nul
-if exist "Å©·Î¹Ì¿ò_¼³Ä¡.bat"   copy /y "Å©·Î¹Ì¿ò_¼³Ä¡.bat"   "dist\" >nul
-if exist "»ç¿ë¼³¸í¼­.txt"       copy /y "»ç¿ë¼³¸í¼­.txt"       "dist\" >nul
+if exist "Å©ï¿½Î¹Ì¿ï¿½_ï¿½ï¿½Ä¡.bat"   copy /y "Å©ï¿½Î¹Ì¿ï¿½_ï¿½ï¿½Ä¡.bat"   "dist\" >nul
+if exist "ï¿½ï¿½ë¼³ï¿½ï¿½ï¿½ï¿½.txt"       copy /y "ï¿½ï¿½ë¼³ï¿½ï¿½ï¿½ï¿½.txt"       "dist\" >nul
 
 echo.
 echo [3/3] Creating .env template...

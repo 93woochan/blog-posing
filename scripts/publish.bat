@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 > nul
-cd /d "%~dp0"
+cd /d "%~dp0\.."
 
 REM Drag and Drop Folder Path
 SET TARGET=%~1
@@ -12,13 +12,13 @@ REM SET TARGET=C:\your_folder_path_here
 if "%TARGET%"=="" (
     echo.
     echo ====================================================
-    echo   Naver Auto Posting - Generator
+    echo   Naver Auto Posting - Publisher
     echo ====================================================
     echo.
     echo [ERROR] No target folder selected!
     echo.
     echo Usage: 
-    echo   Drag and drop your photo folder onto this 'generate.bat' file.
+    echo   Drag and drop your image folder onto this 'publish.bat' file.
     echo.
     pause
     exit /b 0
@@ -30,7 +30,7 @@ echo   Target Folder: %TARGET%
 echo ====================================================
 echo.
 echo Running Python script...
-python -m src.post "%TARGET%"
+python -m src.publisher "%TARGET%"
 
 echo.
 echo ====================================================
